@@ -1,3 +1,4 @@
+import argparse
 import csv
 import os
 import pickle
@@ -6,12 +7,8 @@ import numpy as np
 from sim.config import load_config
 from sim.world import World
 from sim.agent import Agent
-from sim.evolve import try_reproduce
-
-CONFIG_PATH = "config/base.yaml"
-OUT_DIR = "data/run1"
-CKPT = os.path.join(OUT_DIR, "checkpoint.pkl")
-LOG = os.path.join(OUT_DIR, "log.csv")
+from sim.evolve import reproduce
+from sim.metrics import METRIC_KEYS, snapshot
 
 
 def random_agent(world, a_cfg, rng):
@@ -28,49 +25,61 @@ def new_state(cfg):
     return {"tick": 0, "rng": rng, "world": world, "agents": agents}
 
 
-def save_checkpoint(state):
-    tmp = CKPT + ".tmp"
+def save_checkpoint(state, path):
+    tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         pickle.dump(state, f)
-    os.replace(tmp, CKPT)   # safe: never leaves a half-written file
+    os.replace(tmp, path)
+
+
+def mean_or_nan(values):
+    return float(np.mean(values)) if values else float("nan")
 
 
 def main():
-    cfg = load_config(CONFIG_PATH)
-    a_cfg, run_cfg = cfg["agents"], cfg["run"]
-    os.makedirs(OUT_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--out", default="data/run1")
+    args = parser.parse_args()
 
-    if os.path.exists(CKPT):
-        with open(CKPT, "rb") as f:
+    cfg = load_config("config/base.yaml")
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    a_cfg, run_cfg = cfg["agents"], cfg["run"]
+
+    os.makedirs(args.out, exist_ok=True)
+    ckpt = os.path.join(args.out, "checkpoint.pkl")
+    log = os.path.join(args.out, "log.csv")
+
+    if os.path.exists(ckpt):
+        with open(ckpt, "rb") as f:
             state = pickle.load(f)
         print(f"Resuming from tick {state['tick']}")
     else:
         state = new_state(cfg)
-        with open(LOG, "w", newline="") as f:
+        with open(log, "w", newline="") as f:
             csv.writer(f).writerow(
-                ["tick", "population", "mean_energy",
-                 "births", "mean_lifespan", "rescues"])
-        print("Starting a new run")
+                ["tick", "population", "births", "rescues",
+                 "lifespan_f", "lifespan_m"] + METRIC_KEYS)
+        print(f"Starting a new run (seed {cfg['seed']})")
 
     rng, world = state["rng"], state["world"]
     agents, tick = state["agents"], state["tick"]
-    births, rescues, lifespans = 0, 0, []
+    births, rescues, dead = 0, 0, []
 
     while tick < run_cfg["total_ticks"]:
         world.step()
-        newborns = []
         for a in agents:
             a.step(world, a_cfg)
-            if a.alive and len(agents) + len(newborns) < a_cfg["max_population"]:
-                child = try_reproduce(a, world.size, a_cfg, rng)
-                if child is not None:
-                    newborns.append(child)
-                    births += 1
 
-        lifespans += [a.age for a in agents if not a.alive]
+        room = a_cfg["max_population"] - len(agents)
+        newborns = reproduce([a for a in agents if a.alive],
+                             world.size, a_cfg, rng, room)
+        births += len(newborns)
+
+        dead += [(a.age, a.sex) for a in agents if not a.alive]
         agents = [a for a in agents if a.alive] + newborns
 
-        # safety net: stop total extinction during early tuning
         while len(agents) < a_cfg["min_population"]:
             agents.append(random_agent(world, a_cfg, rng))
             rescues += 1
@@ -78,22 +87,25 @@ def main():
         tick += 1
 
         if tick % run_cfg["log_every"] == 0:
-            mean_e = float(np.mean([a.energy for a in agents]))
-            mean_l = float(np.mean(lifespans)) if lifespans else float("nan")
-            with open(LOG, "a", newline="") as f:
+            snap = snapshot(agents, tick)
+            lf = mean_or_nan([age for age, sx in dead if sx == 0])
+            lm = mean_or_nan([age for age, sx in dead if sx == 1])
+            with open(log, "a", newline="") as f:
                 csv.writer(f).writerow(
-                    [tick, len(agents), round(mean_e, 2),
-                     births, round(mean_l, 2), rescues])
-            print(f"tick {tick}: pop={len(agents)} lifespan={mean_l:.1f} "
+                    [tick, len(agents), births, rescues,
+                     round(lf, 2), round(lm, 2)]
+                    + [round(snap[k], 4) for k in METRIC_KEYS])
+            print(f"tick {tick}: pop={len(agents)} "
+                  f"F={snap['n_female']} M={snap['n_male']} "
                   f"births={births} rescues={rescues}")
-            births, rescues, lifespans = 0, 0, []
+            births, rescues, dead = 0, 0, []
 
         if tick % run_cfg["checkpoint_every"] == 0:
             state.update(tick=tick, agents=agents)
-            save_checkpoint(state)
+            save_checkpoint(state, ckpt)
 
     state.update(tick=tick, agents=agents)
-    save_checkpoint(state)
+    save_checkpoint(state, ckpt)
     print("Finished.")
 
 
